@@ -1,45 +1,54 @@
 package com.guitarfactory.service;
 
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.time.Year;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.springframework.stereotype.Service;
+
 import com.guitarfactory.domain.dto.request.GuitarOrderRequest;
 import com.guitarfactory.domain.dto.response.GuitarResponse;
 import com.guitarfactory.domain.entity.Guitar;
 import com.guitarfactory.domain.entity.GuitarModel;
 import com.guitarfactory.domain.entity.GuitarSpec;
-import com.guitarfactory.domain.enums.BridgeType;
+import com.guitarfactory.domain.entity.PriceAdjustment;
 import com.guitarfactory.domain.enums.BuildStatus;
-import com.guitarfactory.domain.enums.FinishType;
 import com.guitarfactory.domain.enums.GuitarOS;
-import com.guitarfactory.domain.enums.PickupType;
-import com.guitarfactory.domain.enums.WoodType;
 import com.guitarfactory.exception.BusinessRuleException;
 import com.guitarfactory.exception.ResourceNotFoundException;
 import com.guitarfactory.mapper.GuitarMapper;
 import com.guitarfactory.mapper.GuitarSpecMapper;
 import com.guitarfactory.repository.GuitarModelRepository;
 import com.guitarfactory.repository.GuitarRepository;
-import org.springframework.stereotype.Service;
-
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
-import java.time.Year;
-import java.util.List;
+import com.guitarfactory.repository.PriceAdjustmentRepository;
 
 @Service
 public class GuitarService {
+	
+    private static final String EXTRA_STRING_FEE = "EXTRA_STRING_FEE";
 
     private final GuitarRepository repository;
     private final GuitarModelRepository modelRepository;
     private final GuitarMapper mapper;
     private final GuitarSpecMapper specMapper;
+    private final PriceAdjustmentRepository priceAdjustmentRepository;
 
     public GuitarService(GuitarRepository repository,
                           GuitarModelRepository modelRepository,
                           GuitarMapper mapper,
-                          GuitarSpecMapper specMapper) {
+                          GuitarSpecMapper specMapper,
+                          com.guitarfactory.repository.PriceAdjustmentRepository priceAdjustmentRepository) {
         this.repository = repository;
         this.modelRepository = modelRepository;
         this.mapper = mapper;
         this.specMapper = specMapper;
+        this.priceAdjustmentRepository = priceAdjustmentRepository;
     }
 
     public GuitarResponse placeOrder(GuitarOrderRequest request) {
@@ -64,10 +73,8 @@ public class GuitarService {
         guitar.setCustomerName(request.customerName());
         guitar.setCustomerEmail(request.customerEmail());
 
-        // First save to generate ID (@PrePersist sets status=ORDERED and orderedAt)
         guitar = repository.save(guitar);
 
-        // Generate serial number using the assigned ID
         guitar.setSerialNumber("GF-" + Year.now() + "-" + String.format("%06d", guitar.getId()));
         guitar = repository.save(guitar);
 
@@ -131,35 +138,59 @@ public class GuitarService {
         repository.deleteById(id);
     }
 
-    // Step 9 — price upcharge rules
+
     private BigDecimal calculateFinalPrice(GuitarModel model, GuitarSpec spec) {
-        BigDecimal price = model.getBasePrice();
 
-        if (spec.getBridgeType() == BridgeType.FLOYD_ROSE) {
-            price = price.add(new BigDecimal("200.00"));
-        } else if (spec.getBridgeType() == BridgeType.BIGSBY) {
-            price = price.add(new BigDecimal("120.00"));
-        }
+        BigDecimal basePrice = model.getBasePrice();
 
-        if (spec.getNeckPickup() == PickupType.ACTIVE_HUMBUCKER
-                || spec.getBridgePickup() == PickupType.ACTIVE_HUMBUCKER) {
-            price = price.add(new BigDecimal("150.00"));
-        }
+        List<String> itemKeys = Stream.of(
+                        spec.getBridgeType(),
+                        spec.getBodyWood(),
+                        spec.getFinishType(),
+                        spec.getNeckPickup(),
+                        spec.getBridgePickup()
+                )
+                .filter(Objects::nonNull)
+                .map(Enum::name)
+                .collect(Collectors.toCollection(ArrayList::new));
 
+        itemKeys.add(EXTRA_STRING_FEE);
+
+        Map<String, BigDecimal> adjustments =
+                priceAdjustmentRepository.findByItemKeyIn(itemKeys)
+                        .stream()
+                        .collect(Collectors.toMap(
+                                PriceAdjustment::getItemKey,
+                                PriceAdjustment::getAdjustmentPrice,
+                                (existing, _) -> existing
+                        ));
+
+        BigDecimal specAdjustmentsTotal = itemKeys.stream()
+                .filter(key -> !EXTRA_STRING_FEE.equals(key))
+                .map(key -> adjustments.getOrDefault(key, BigDecimal.ZERO))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal extraStringsAdjustment = calculateExtraStringsAdjustment(spec, adjustments);
+
+        return basePrice
+                .add(specAdjustmentsTotal)
+                .add(extraStringsAdjustment);
+    }
+
+    private BigDecimal calculateExtraStringsAdjustment(
+            GuitarSpec spec,
+            Map<String, BigDecimal> adjustments
+    ) {
         int extraStrings = spec.getNumberOfStrings() - 6;
-        if (extraStrings > 0) {
-            price = price.add(new BigDecimal("100.00").multiply(new BigDecimal(extraStrings)));
+
+        if (extraStrings <= 0) {
+            return BigDecimal.ZERO;
         }
 
-        if (spec.getBodyWood() == WoodType.KOA) {
-            price = price.add(new BigDecimal("300.00"));
-        }
+        BigDecimal feePerString =
+                adjustments.getOrDefault(EXTRA_STRING_FEE, BigDecimal.ZERO);
 
-        if (spec.getFinishType() == FinishType.NITROCELLULOSE_LACQUER) {
-            price = price.add(new BigDecimal("175.00"));
-        }
-
-        return price;
+        return feePerString.multiply(BigDecimal.valueOf(extraStrings));
     }
 
     private Guitar getOrThrow(Long id) {
